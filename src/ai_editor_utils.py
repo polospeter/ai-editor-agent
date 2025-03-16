@@ -147,9 +147,9 @@ async def describe_image(image_path):
         response = openai_client.chat.completions.create(
             model=AZURE_DEPLOYMENT,
             messages=[
-                {"role": "system", "content": "You are a detailed image analyzer. Describe what you see in the image with specific details about the scene, people, objects, lighting, and atmosphere."},
+                {"role": "system", "content": "You are a detailed image analyzer. Describe what you see in the image with specific details about the scene, camera shot type, objects, lighting, and atmosphere."},
                 {"role": "user", "content": [
-                    {"type": "text", "text": "Describe this image in detail."},
+                    {"type": "text", "text": "Describe this image in a brief, straight to the point way. What is in focus on the image, what is the camera shot and angle, what action the subject(s) doing. keep it to less than 2 sentence."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]}
             ],
@@ -182,7 +182,7 @@ async def analyze_video_content(first_frame_description, last_frame_description,
         response = openai_client.chat.completions.create(
             model=AZURE_DEPLOYMENT,
             messages=[
-                {"role": "system", "content": "You are a video content analyzer. Based on descriptions of the first and last frames of a video, infer what likely happens during the footage. Be creative but realistic in your analysis."},
+                {"role": "system", "content": "You are a video content analyzer. Based on descriptions of the first and last frames of a video, infer what likely happens during the footage. Keep your answer really short."},
                 {"role": "user", "content": f"""
                 {metadata_text}
                 
@@ -192,7 +192,7 @@ async def analyze_video_content(first_frame_description, last_frame_description,
                 Last frame description:
                 {last_frame_description}
                 
-                Based on these descriptions, what likely happens in this video footage? Provide a narrative that connects the first and last frames.
+                Based on these descriptions, explain very briefly what likely happens in this video footage? Focus on the actions by the characters and the camera movements, and if something changes or new element appears in the video. Keep your answer straight to the point.
                 """}
             ],
             max_tokens=800
@@ -244,7 +244,7 @@ async def analyze_video(video_path):
             "path": last_frame_path,
             "description": None
         },
-        "content_analysis": None
+        "video_description": None
     }
     
     # Describe first frame
@@ -260,7 +260,7 @@ async def analyze_video(video_path):
     # Analyze video content based on frame descriptions
     if results["first_frame"]["description"] and results["last_frame"]["description"]:
         print("Analyzing video content...")
-        results["content_analysis"] = await analyze_video_content(
+        results["video_description"] = await analyze_video_content(
             results["first_frame"]["description"],
             results["last_frame"]["description"],
             metadata
@@ -347,6 +347,109 @@ async def analyze_videos_in_folder(folder_path, output_json=None):
     
     return all_analyses
 
+
+async def generate_shot_list_from_analysis(analysis_data, output_json=None):
+    """
+    Generate a shot list narrative in JSON format based on video analysis results.
+    
+    Args:
+        analysis_data: Dictionary containing video analysis results
+        output_json: Optional path to save the shot list JSON file
+        
+    Returns:
+        Dictionary containing the shot list in JSON format
+    """
+    print("\nGenerating shot list from video analysis...")
+    
+    if not analysis_data or "videos" not in analysis_data or not analysis_data["videos"]:
+        print("No video analysis data available to generate shot list")
+        return None
+    
+    # Extract relevant information for the prompt
+    videos_info = []
+    for video in analysis_data["videos"]:
+        if "video_description" in video and video["video_description"]:
+            video_info = {
+                "filename": video["filename"],
+                "content": video["video_description"],
+                "duration": video["metadata"].get("duration_formatted", "unknown"),
+                "duration_seconds": video["metadata"].get("duration", 0)
+            }
+            videos_info.append(video_info)
+    
+    # Create a prompt for the AI to generate a shot list
+    videos_text = ""
+    for i, video in enumerate(videos_info):
+        videos_text += f"Video {i+1}: {video['filename']}\n"
+        videos_text += f"Duration: {video['duration']}\n"
+        videos_text += f"Content: {video['content']}\n\n"
+    
+    try:
+        # Call Azure OpenAI API to generate shot list
+        response = openai_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": """You are a professional video editor. 
+                Your task is to create a shot list in JSON format that tells a coherent story using the available footage.
+                Analyze the content of each video and suggest an order, timestamps, and transitions that would create a compelling narrative.
+                The output should be valid JSON with the following structure:
+                {
+                  "project_name": "A descriptive name based on the content",
+                  "narrative_theme": "A brief description of the story or theme",
+                  "shots": [
+                    {
+                      "filename": "original_filename.mp4",
+                      "description": "Brief description of this shot's purpose in the narrative",
+                      "start_time": "HH:MM:SS",
+                      "end_time": "HH:MM:SS",
+                      "duration": "HH:MM:SS",
+                      "transition_in": "fade in/dissolve/cut/etc",
+                      "transition_out": "fade out/dissolve/cut/etc"
+                    }
+                  ],
+                  "audio_suggestions": {
+                    "background_music": "Style of music that would fit",
+                    "sound_effects": ["List", "of", "suggested", "sound effects"]
+                  }
+                }
+                Use realistic timestamps based on the actual duration of each video.
+                Be creative but practical in your suggestions."""},
+                {"role": "user", "content": f"""Here are the videos available for editing:
+                
+                {videos_text}
+                
+                Based on these videos, create a shot list in JSON format that tells a coherent story.
+                The shot list should suggest an order for the footage, with appropriate in/out points and transitions.
+                Return ONLY the JSON with no additional text."""}
+            ],
+            max_tokens=2000,
+            temperature=0.7
+        )
+        
+        # Extract and parse the JSON response
+        shot_list_text = response.choices[0].message.content
+        
+        # Clean up the response to ensure it's valid JSON
+        # Remove any markdown code block indicators and extra text
+        if "```json" in shot_list_text:
+            shot_list_text = shot_list_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in shot_list_text:
+            shot_list_text = shot_list_text.split("```")[1].split("```")[0].strip()
+        
+        shot_list = json.loads(shot_list_text)
+        
+        # Save to JSON file if requested
+        if output_json:
+            with open(output_json, 'w') as f:
+                json.dump(shot_list, f, indent=2)
+            print(f"Shot list saved to {output_json}")
+        
+        return shot_list
+    
+    except Exception as e:
+        print(f"Error generating shot list: {e}")
+        return None
+
 async def main():
     import argparse
     
@@ -359,6 +462,8 @@ async def main():
     parser.add_argument('--output', '-o', help='Path to save the JSON output file (defaults to [folder_name]_analysis.json in the input folder)')
     parser.add_argument('--test-only', action='store_true', help='Only test the API connection without analyzing videos')
     parser.add_argument('--api-key', help='Azure OpenAI API key (overrides environment variable)')
+    parser.add_argument('--generate-shot-list', action='store_true', 
+                        help='Generate a shot list narrative based on video analysis')
     
     args = parser.parse_args()
     
@@ -414,11 +519,18 @@ async def main():
         for video in analyses['videos']:
             print(f"\n--- {video['filename']} ---")
             print("\nContent Analysis:")
-            print(video.get('content_analysis', 'No analysis available'))
+            print(video.get('video_description', 'No analysis available'))
             print("\n" + "-" * 80)
     
     if analyses['total_videos'] > 0:
         print(f"\nFull analysis saved to: {output_path}")
+
+    if args.generate_shot_list and analyses and "videos" in analyses and analyses["videos"]:
+        # Generate shot list filename based on the output path
+        shot_list_path = os.path.splitext(output_path)[0] + "_shot_list.json"
+        shot_list = await generate_shot_list_from_analysis(analyses, shot_list_path)
+        if shot_list:
+            print(f"\nShot list generated and saved to: {shot_list_path}")
 
 if __name__ == "__main__":
     # If script is run directly, run the test function
